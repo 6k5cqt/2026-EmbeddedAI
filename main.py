@@ -21,12 +21,18 @@ LOG_FILE   = "round2.log"
 ENABLE_LOG = True
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
 decision_logger = logging.getLogger("decision_thread")
 decision_logger.setLevel(logging.DEBUG)
+decision_logger.propagate = False
+
+_sh = logging.StreamHandler()
+_sh.setLevel(logging.DEBUG)
+_sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+decision_logger.addHandler(_sh)
 
 if ENABLE_LOG:
     _fh = RotatingFileHandler(LOG_FILE, mode='w', maxBytes=5*1024*1024,
@@ -58,6 +64,8 @@ def main():
     lane.start()
     yolo_signal.start()
     yolo_drivable.start()
+
+    time.sleep(2)
     decision.start()
 
     try:

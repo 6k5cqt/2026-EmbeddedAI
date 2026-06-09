@@ -19,9 +19,14 @@ ROI_BOT_RATIO  = 0.9
 TARGET_Y_RATIO = 0.3
 
 MIN_SEG_WIDTH  = 20
-MIN_MASK_RATIO = 0.15
+MIN_MASK_RATIO = 0.20
 CENTER_TOL     = 0.4
 OFFSET_SCALE = 2.0  # offset 스케일 조정
+OPEN_FIELD_THRES = 0.80 #이거 아래면 임시차선
+
+# ── 디버그 영상 저장 옵션 ───────────────────────
+SAVE     = False                        # True 로 바꾸면 저장
+SAVE_DIR = "./debug_output"             # 저장 폴더 (없으면 자동 생성)
 # ───────────────────────────────────────────────
 
 DUMMY = {'state': 'no_detection', 'offset': 0.0, 'mask_ratio': 0.0}
@@ -64,11 +69,11 @@ class YoloDrivableThread(threading.Thread):
         mask_ratio = mask.sum() / (h * w)
 
         if mask_ratio < MIN_MASK_RATIO:
-            return {'state': 'stop', 'offset': 0.0, 'mask_ratio': float(mask_ratio)}, None, None, None
+            return {'state': 'stop', 'offset': 0.0, 'mask_ratio': float(mask_ratio)}, None, None, None, None, None, None
 
         rows = np.any(mask, axis=1)
         if not rows.any():
-            return {'state': 'stop', 'offset': 0.0, 'mask_ratio': float(mask_ratio)}, None, None, None
+            return {'state': 'stop', 'offset': 0.0, 'mask_ratio': float(mask_ratio)}, None, None, None, None, None, None
 
         y_min, y_max = np.where(rows)[0][[0, -1]]
         box_h    = y_max - y_min
@@ -78,6 +83,7 @@ class YoloDrivableThread(threading.Thread):
         center_x = w // 2
 
         pts = []
+        widths = [] # 누적가로폭
         for y in range(y_start, y_end, 10):
             r = self._largest_segment_bounds(mask[y])
             if r is None:
@@ -89,9 +95,10 @@ class YoloDrivableThread(threading.Thread):
             if abs(cx - center_x) > w * CENTER_TOL:
                 continue
             pts.append((cx, y))
+            widths.append(rx - lx)
 
         if len(pts) < 5:
-            return {'state': 'insufficient', 'offset': 0.0, 'mask_ratio': float(mask_ratio)}, None, None, None
+            return {'state': 'insufficient', 'offset': 0.0, 'mask_ratio': float(mask_ratio)}, None, None, None, None, None, None
 
         xs_arr = np.array([p[0] for p in pts], dtype=float)
         ys_arr = np.array([p[1] for p in pts], dtype=float)
@@ -100,8 +107,15 @@ class YoloDrivableThread(threading.Thread):
         target_x = int(np.clip(poly(target_y), 0, w - 1))
         offset = (target_x - center_x) / (w // 2) * OFFSET_SCALE
 
+        avg_width_ratio = np.mean(widths) / w
+
+        if avg_width_ratio > OPEN_FIELD_THRES:
+            current_state = 'ok'       # 완전 허허벌판 상황
+        else:
+            current_state = 'road_ok'  # 양옆이 막혀 차선 형태가 잡힌 상황
+
         # 제어 스레드(DecisionThread) 파손을 막기 위해 기존 딕셔너리와 시각화용 변수들을 함께 리턴
-        return {'state': 'ok', 'offset': float(offset), 'mask_ratio': float(mask_ratio)}, poly, target_y, target_x
+        return {'state': current_state, 'offset': float(offset), 'mask_ratio': float(mask_ratio)}, poly, target_y, target_x, y_start, y_end, pts
 
     def run(self):
         self.running = True
@@ -111,6 +125,13 @@ class YoloDrivableThread(threading.Thread):
         # ── 이 스레드가 시작될 때 Flask 백그라운드 웹 서버도 같이 시작 ──
         threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, threaded=True), daemon=True).start()
         logger.info("[DRIVABLE] Visualization Web Server started on port 5000")
+
+        # ── 디버그 영상 저장용 VideoWriter 초기화 ──
+        _writer = None
+        if SAVE:
+            import os, datetime
+            os.makedirs(SAVE_DIR, exist_ok=True)
+            _save_path = None  # 첫 프레임에서 해상도 확인 후 생성
 
         while self.running:
             frame = self.camera.get_frame()
@@ -125,31 +146,83 @@ class YoloDrivableThread(threading.Thread):
             
             # 주행 데이터 처리 및 시각화용 데이터 추출
             if mask is not None:
-                result, poly, target_y, target_x = self._compute(mask)
+                result, poly, target_y, target_x, y_start, y_end, pts = self._compute(mask)
             else:
-                result, poly, target_y, target_x = DUMMY, None, None, None
+                result, poly, target_y, target_x, y_start, y_end, pts = DUMMY, None, None, None, None, None, None
 
-            # ── [디버깅용 실시간 시각화 이미지 그리기] ──
-            debug_img = frame.copy()
-            
-            # 1. 주행 가능 영역 초록색 반투명 마스크 표시
-            if mask is not None:
-                debug_img[mask] = debug_img[mask] * 0.6 + np.array([0, 255, 0], dtype=np.uint8) * 0.4
-            
-            # 2. 피팅된 2차 함수 라인 그리기
-            if poly is not None:
-                ys = np.arange(int(frame.shape[0] * ROI_TOP_RATIO), int(frame.shape[0] * ROI_BOT_RATIO), 10)
-                xs = poly(ys).astype(int)
-                for i in range(len(xs) - 1):
-                    if 0 <= xs[i] < frame.shape[1] and 0 <= xs[i+1] < frame.shape[1]:
-                        cv2.line(debug_img, (xs[i], ys[i]), (xs[i+1], ys[i+1]), (255, 0, 0), 3) # 파란색 선
-                
-                # 3. 타겟 지점 빨간색 원 표시
-                cv2.circle(debug_img, (target_x, target_y), 10, (0, 0, 255), -1)
-                
-            # 4. 현재 상태 및 Offset 텍스트 출력
-            cv2.putText(debug_img, f"State: {result['state']}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-            cv2.putText(debug_img, f"Offset: {result['offset']:.2f}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            # ── [디버깅용 실시간 시각화 이미지 그리기] (manual_test.py 동일 스타일) ──
+            # 베이스: results[0].plot() → YOLO 세그멘테이션 오버레이 포함
+            debug_img = results.plot()
+            h_f, w_f  = debug_img.shape[:2]
+            center_x  = w_f // 2
+
+            # mask_ratio 텍스트 (항상 표시)
+            cv2.putText(debug_img, f"mask: {result['mask_ratio']:.3f}", (10, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2)
+
+            state = result['state']
+            if state in ('no_detection', 'stop'):
+                label = "STOP: no detection" if state == 'no_detection' else "STOP: drivable area too small"
+                cv2.putText(debug_img, label, (10, 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+
+            elif state == 'insufficient':
+                cv2.putText(debug_img, "insufficient points", (10, 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                # ROI 경계선 + 중앙 허용범위선은 그려줌
+                if y_start is not None:
+                    cv2.line(debug_img, (0, y_start), (w_f, y_start), (100, 100, 100), 1)
+                    cv2.line(debug_img, (0, y_end),   (w_f, y_end),   (100, 100, 100), 1)
+                    cv2.line(debug_img, (int(center_x - w_f * CENTER_TOL), 0),
+                                        (int(center_x - w_f * CENTER_TOL), h_f), (50, 50, 50), 1)
+                    cv2.line(debug_img, (int(center_x + w_f * CENTER_TOL), 0),
+                                        (int(center_x + w_f * CENTER_TOL), h_f), (50, 50, 50), 1)
+                # pts 초록 점
+                if pts:
+                    for (cx, cy) in pts:
+                        cv2.circle(debug_img, (cx, cy), 3, (0, 255, 0), -1)
+
+            else:  # 'ok'
+                # 1. ROI 경계 회색 수평선
+                cv2.line(debug_img, (0, y_start), (w_f, y_start), (100, 100, 100), 1)
+                cv2.line(debug_img, (0, y_end),   (w_f, y_end),   (100, 100, 100), 1)
+                # 2. 중앙 허용범위 어두운 수직선
+                cv2.line(debug_img, (int(center_x - w_f * CENTER_TOL), 0),
+                                    (int(center_x - w_f * CENTER_TOL), h_f), (50, 50, 50), 1)
+                cv2.line(debug_img, (int(center_x + w_f * CENTER_TOL), 0),
+                                    (int(center_x + w_f * CENTER_TOL), h_f), (50, 50, 50), 1)
+                # 3. 피팅 샘플 포인트 초록 점
+                for (cx, cy) in pts:
+                    cv2.circle(debug_img, (cx, cy), 3, (0, 255, 0), -1)
+                # 4. 피팅 곡선 빨간색 step=5
+                curve_pts = []
+                for y in range(y_start, y_end, 5):
+                    x = int(poly(y))
+                    if 0 <= x < w_f:
+                        curve_pts.append((x, y))
+                for i in range(len(curve_pts) - 1):
+                    cv2.line(debug_img, curve_pts[i], curve_pts[i+1], (0, 0, 255), 2)
+                # 5. 타겟 지점 파란 원 + 중앙→타겟 시안 선
+                cv2.circle(debug_img, (target_x, target_y), 10, (255, 0, 0), -1)
+                cv2.line(debug_img, (center_x, target_y), (target_x, target_y), (255, 255, 0), 2)
+                # 6. offset 텍스트
+                if state == 'ok':
+                    cv2.putText(debug_img, f"OK (Open Field) offset: {result['offset']:+.3f}", (10, 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 2)
+                else:  # 'road_ok'
+                    cv2.putText(debug_img, f"ROAD_OK (Lane) offset: {result['offset']:+.3f}", (10, 45),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+
+            # ── 디버그 영상 저장 ──
+            if SAVE:
+                if _writer is None:
+                    import datetime, os
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _save_path = os.path.join(SAVE_DIR, f"drivable_{ts}.mp4")
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    _writer = cv2.VideoWriter(_save_path, fourcc, 30, (w_f, h_f))
+                    logger.info(f"[DRIVABLE] Saving debug video: {_save_path}")
+                _writer.write(debug_img)
 
             # 웹서버로 보낼 공유 버퍼 갱신
             with debug_lock:
@@ -160,6 +233,11 @@ class YoloDrivableThread(threading.Thread):
             logger.debug(f"[DRIVABLE] {result}")
             with self._lock:
                 self._result = result
+
+        # ── 루프 종료 시 VideoWriter 해제 ──
+        if SAVE and _writer is not None:
+            _writer.release()
+            logger.info(f"[DRIVABLE] Saved debug video: {_save_path}")
 
     def get_result(self):
         with self._lock:
