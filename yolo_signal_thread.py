@@ -77,9 +77,9 @@ class YoloSignalThread(threading.Thread):
                     continue
                 
                 # [적용] 좌우 표지판 검증 로직
-                if cls_name in ['sign_left', 'sign_right']:
-                    if not self._verify_direction(frame, box, cls_name):
-                        continue # 가짜(방향 오류)면 통과시킴
+                #if cls_name in ['sign_left', 'sign_right']:
+                    #if not self._verify_direction(frame, box, cls_name):
+                        #continue # 가짜(방향 오류)면 통과시킴
 
                 # 결과 저장 (이름, 면적, 중심X)
                 area = float((box.xyxy[0][2] - box.xyxy[0][0]) * (box.xyxy[0][3] - box.xyxy[0][1]))

@@ -12,7 +12,7 @@ ROI_BOT_RATIO  = 0.9
 TARGET_Y_RATIO = 0.3
 
 MIN_SEG_WIDTH  = 20
-MIN_MASK_RATIO = 0.25
+MIN_MASK_RATIO = 0.15
 CENTER_TOL     = 0.4
 OFFSET_SCALE = 2.0  # offset 스케일 조정
 # ───────────────────────────────────────────────

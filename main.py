@@ -21,7 +21,7 @@ LOG_FILE   = "round2.log"
 ENABLE_LOG = True
 
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
