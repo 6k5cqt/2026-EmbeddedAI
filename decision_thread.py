@@ -3,29 +3,30 @@ import time
 import logging
 
 from ctrl_utils import BaseController
+from config import FRAME_WIDTH, RATIO_OFFSET
 
 logger = logging.getLogger(__name__)
 
 # ── Params ────────────────────────────────────────────────────
 DEBUG_LOG_INTERVAL = 1
-MORE = False #class counter 보고싶을 때 True
+MORE = True #class counter 보고싶을 때 True
 
 # 사용 표지판만 정의
 NAME_DIR = {
-    'LEFT': 'sign_left', 'RIGHT': 'sign_right', 'STOP': 'sign_stop'
+    'LEFT': 'sign_left', 'RIGHT': 'sign_right', 'PACKET': 'sign_stop', 'BIG_PACKET': 'sign_stop'
 }
 
 # 각 class별 카운팅 임계치
 CLASS_SIZE_TR = {
-    'LEFT': 5000, 'RIGHT': 5000, 'STOP': 2000,
+    'LEFT': 2500, 'RIGHT': 2500, 'PACKET': 1000, 'BIG_PACKET':5000
 }
 COUNTER_TR = {
-    'LEFT': 5, 'RIGHT': 5, 'STOP': 5, 'DEFAULT': 10, 'EOR':7
+    'LEFT': 5, 'RIGHT': 5, 'DEFAULT': 10, 'EOR':7, 'PACKET': 5, 'BIG_PACKET':5
 }
 
 # 시나리오 파라미터
 DEFAULT_SPEED = 0.2
-EOR_TURN_SPEED = 0.4
+EOR_TURN_SPEED = 0.37
 
 # utils
 UART_DEV  = '/dev/ttyUSB0'
@@ -49,7 +50,7 @@ class DecisionThread(threading.Thread):
 
         self.result = {}
         self.state = 'OFFROAD'
-        self.return_val = [0.0, 0.0]
+        self.return_val = [0.0, 0.0, 'normal']
         self._log_counter = 0
         self.triggered = ''
         self.travere_counter = 0
@@ -97,27 +98,37 @@ class DecisionThread(threading.Thread):
             else:
                 self.class_counters[key] = max(0, self.class_counters.get(key, 0) - 1)
 
-    def _check_counter(self):
+    def _check_one_counter(self):
         self.triggered = {key: self.class_counters.get(key, 0)
                     for key in NAME_DIR
                     if self.class_counters.get(key, 0) >= COUNTER_TR[key]}
         return max(self.triggered, key=self.triggered.get) if self.triggered else None
+    
 
-    def _traverse(self, condition: bool, target_state: str):
+    def _check_all_counter(self):
+        self.triggered = {key: self.class_counters.get(key, 0)
+                    for key in NAME_DIR
+                    if self.class_counters.get(key, 0) >= COUNTER_TR[key]}
+        return list(self.triggered.keys()) if self.triggered else []
+
+    def _traverse(self, condition: bool, target_state: str, reset=True):
         if condition:
             self.state = target_state
-            self.class_counters = {}
+            if reset: self.class_counters = {}
 
     def _process_yolo(self):
         self.detections = self.yolo.get_result()
         self._update_class_counters(self.detections)
-        triggered = self._check_counter()
+        triggered = self._check_one_counter()
+        triggered_all = self._check_all_counter()
 
-        if self.state == 'DEFAULT':
-            if triggered == 'STOP':
-                self.lane.pause() # 오프로드 백 진입 시 딱 한 번 수행
-                self.prev_time = time.time()
-                self.state = 'OFFROAD_BACK'
+        if self.state == 'OFFROAD':
+            self._traverse(triggered == 'RIGHT', 'EOR_RIGHT')
+            self._traverse(triggered == 'LEFT', 'EOR_LEFT')
+            self._traverse('PACKET' in triggered_all, 'GOING_PAKCKET')
+        if self.state == 'GOING_PAKCKET':
+            self._traverse('BIG_PACKET' in triggered_all, 'LOADING', False)
+
 
     def _count_traverse(self, condition):
         if condition:
@@ -142,34 +153,38 @@ class DecisionThread(threading.Thread):
                 return False
             
     def _process_lane(self):
+        self.result = self.drivable.get_result()
         if self.state == 'OFFROAD':
-            self.result = self.drivable.get_result()
             offset_ratios = [self.result['offset']] if self.result['state'] in ('ok', 'road_ok') else [0.0]
-            speed = DEFAULT_SPEED
-            self.return_val[:] = offset_ratios[-1], speed
-
-            # End Of the Road 카운터 쌓는 부분, traverse
-            # EOR은 self.traverse_counter로 LEFT, RIGHT는 self.class_counter로 트레버스 함에 주의
-            self._count_traverse(condition=self.result['state'] in ('stop', 'no_detection'))
-            if self._is_traverse(threshold=COUNTER_TR['EOR']):
-                if self.triggered == 'LEFT':
-                    self._traverse(True, 'EOR_LEFT')
-                elif self.triggered == 'RIGHT':
-                    self._traverse(True, 'EOR_LEFT')
-                else:
-                    self._traverse(True, 'EOR')
+            speed = 0.0 if self.result['state'] in ('stop', 'no_detection') else DEFAULT_SPEED
+            self.return_val[:] = offset_ratios[-1], speed, 'normal'
         elif self.state == 'EOR_LEFT':
             # drivable 찾을 때까지 좌회전
-            self.return_val[:] = -EOR_TURN_SPEED, speed
+            self.return_val[:] = -EOR_TURN_SPEED, DEFAULT_SPEED, 'spin'
             # 길 찾을 때까지 카운터 쌓고 traverse
-            self._count_traverse(self.result['state'] == 'road')
+            self._count_traverse(self.result['state'] == 'road_ok')
             self._is_traverse(threshold=5, target='OFFROAD')
         elif self.state == 'EOR_RIGHT':
-            self.return_val[:] = EOR_TURN_SPEED, speed
-            self._count_traverse(self.result['state'] == 'road')
+            self.return_val[:] = +EOR_TURN_SPEED, DEFAULT_SPEED, 'spin'
+            self._count_traverse(self.result['state'] == 'road_ok')
             self._is_traverse(threshold=5, target='OFFROAD')
+        elif self.state == 'GOING_PAKCKET':
+            offset = 0.0
+            for obj in self.detections:
+                if obj[0] == NAME_DIR['PACKET']:
+                    offset = (obj[2] - FRAME_WIDTH / 2) / (FRAME_WIDTH / 2) + RATIO_OFFSET
+                    break
+
+            speed = DEFAULT_SPEED #if self.result['state'] in ('ok', 'road_ok') else 0.0 ## drivable area 없으면 stop
+            self.return_val[:] = offset, speed, 'normal'
+        elif self.state == 'LOADING':
+            speed = 0.0
+            self.return_val[:] = self.result['offset'], speed, 'normal'
+
+            ## loading 끝난거 감지
+            self._traverse(self.class_counters.get('BIG_PACKET', 0) == 0, 'EOR_RIGHT')
         else:
-            self.return_val[:] = 0.0, 0.0
+            self.return_val[:] = 0.0, 0.0, 'normal'
             raise Exception(f"[Decision] Unknown state: {self.state}")
 
     def run(self):
@@ -180,7 +195,7 @@ class DecisionThread(threading.Thread):
             t0 = time.perf_counter()
             self._process_yolo()
             self._process_lane()
-            self._send(self.return_val[0], self.return_val[1])
+            self._send(self.return_val[0], self.return_val[1], type=self.return_val[2])
             
             self._log_counter += 1
             if self._log_counter >= DEBUG_LOG_INTERVAL:
@@ -192,9 +207,18 @@ class DecisionThread(threading.Thread):
 
 
 
-    def _send(self, offset_ratio: float, speed: float):
-        L, R = self._compute_lr(offset_ratio, speed)
-        self._base.send_command({"T": 1, "L": -R, "R": -L})
+    def _send(self, offset_ratio: float, speed: float, type='normal'):
+        if type == 'normal':
+            L, R = self._compute_lr(offset_ratio, speed)
+            self._base.send_command({"T": 1, "L": -R, "R": -L})
+        elif type == 'spin':
+            global INNER_SPEED
+            temp = INNER_SPEED
+            INNER_SPEED = 0.0
+            L, R = self._compute_lr(offset_ratio, speed)
+            self._base.send_command({"T": 1, "L": -R, "R": -L})
+            INNER_SPEED = temp
+
 
     def _debug_log(self):
         offset     = self.result.get('offset', float('nan'))
@@ -202,8 +226,10 @@ class DecisionThread(threading.Thread):
         mask_ratio = self.result.get('mask_ratio', float('nan'))
 
         logger.debug(
-            "[Decision] state=%-14s | drv=%-12s | offset=%+.3f | mask=%.3f | trav=%d",
-            self.state, drv_state, offset, mask_ratio, self.travere_counter
+            "[Decision] state=%-14s | drv=%-12s | offset=%+.3f | mask=%.3f | trav=%d | L=%+.3f R=%+.3f",
+            self.state, drv_state, offset, mask_ratio, self.travere_counter,
+            self.return_val[0], self.return_val[1]
         )
         if MORE:
             logger.debug("[Decision] class_counters=%s", self.class_counters)
+            logger.debug("[Decision] detections=%s", self.detections)

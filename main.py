@@ -17,7 +17,7 @@ from yolo_signal_thread import YoloSignalThread
 from yolo_drivable_thread import YoloDrivableThread
 from decision_thread import DecisionThread
 
-LOG_FILE   = "round2.log"
+LOG_FILE   = "record.log"
 ENABLE_LOG = True
 
 logging.basicConfig(
